@@ -23,7 +23,6 @@ class SyncSettings:
     port: int
     username: str
     password: str
-    known_hosts_file: Path | None
     connection_timeout_seconds: float
     log_level: str
 
@@ -38,23 +37,13 @@ class SyncSettings:
                 raise ConfigurationError(f"Missing required configuration: {name}")
             return value
 
-        known_hosts_value = os.getenv(
-            "VPS_SYNC_KNOWN_HOSTS_FILE",
-            file_values.get("VPS_SYNC_KNOWN_HOSTS_FILE", ""),
-        ).strip()
-
         return cls(
             local_directory=Path(required("VPS_SYNC_LOCAL_DIRECTORY")).expanduser().resolve(),
             remote_directory=required("VPS_SYNC_REMOTE_DIRECTORY"),
             host=required("VPS_SYNC_HOST"),
-            port=_parse_port(
-                os.getenv("VPS_SYNC_PORT", file_values.get("VPS_SYNC_PORT", "22"))
-            ),
+            port=_parse_port(os.getenv("VPS_SYNC_PORT", file_values.get("VPS_SYNC_PORT", "22"))),
             username=required("VPS_SYNC_USERNAME"),
             password=required("VPS_SYNC_PASSWORD"),
-            known_hosts_file=(
-                Path(known_hosts_value).expanduser().resolve() if known_hosts_value else None
-            ),
             connection_timeout_seconds=_parse_timeout(
                 os.getenv(
                     "VPS_SYNC_CONNECTION_TIMEOUT_SECONDS",
@@ -113,9 +102,7 @@ def _parse_timeout(raw_timeout: str) -> float:
     try:
         timeout = float(raw_timeout)
     except ValueError as error:
-        raise ConfigurationError(
-            "VPS_SYNC_CONNECTION_TIMEOUT_SECONDS must be a number"
-        ) from error
+        raise ConfigurationError("VPS_SYNC_CONNECTION_TIMEOUT_SECONDS must be a number") from error
     if timeout <= 0:
         raise ConfigurationError("VPS_SYNC_CONNECTION_TIMEOUT_SECONDS must be positive")
     return timeout
