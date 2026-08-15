@@ -1,0 +1,87 @@
+[project]
+name = "vps-sync"
+version = "0.1.0"
+description = "Synchronize local and remote directories over SFTP using MD5 checks."
+requires-python = ">=3.12"
+dependencies = [
+    "paramiko>=3.5.1,<4",
+]
+
+[project.scripts]
+vps-sync = "vps_sync.cli:main"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.17.0",
+    "pytest>=8.4.0",
+    "pytest-cov>=6.2.0",
+    "ruff>=0.12.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.0,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv]
+cache-dir = ".uv-cache"
+
+[tool.uv.build-backend]
+module-name = "vps_sync"
+module-root = "src"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "A",
+    "ANN",
+    "ARG",
+    "B",
+    "C4",
+    "E",
+    "F",
+    "I",
+    "N",
+    "PERF",
+    "PIE",
+    "PTH",
+    "RUF",
+    "SIM",
+    "UP",
+    "W",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["ANN"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src", "tests"]
+pretty = true
+show_error_codes = true
+warn_unreachable = true
+
+[tool.pytest.ini_options]
+addopts = [
+    "--strict-config",
+    "--strict-markers",
+    "--cov=vps_sync",
+    "--cov-report=term-missing:skip-covered",
+    "--cov-fail-under=80",
+]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["vps_sync"]
+
+[tool.coverage.report]
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+]
