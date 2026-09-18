@@ -109,7 +109,7 @@ class DirectorySynchronizer:
 
     @contextmanager
     def _open_sftp(self) -> Iterator[SFTPClient]:
-        """Open a host-key-verified SSH and SFTP session."""
+        """Open an SSH and SFTP session, accepting unknown host keys."""
         ssh_client = SSHClient()
         ssh_client.load_system_host_keys()
         if self._settings.known_hosts_file is not None:
@@ -118,7 +118,7 @@ class DirectorySynchronizer:
                     f"Known-hosts file does not exist: {self._settings.known_hosts_file}"
                 )
             ssh_client.load_host_keys(str(self._settings.known_hosts_file))
-        ssh_client.set_missing_host_key_policy(paramiko.RejectPolicy())
+        ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
         sftp: SFTPClient | None = None
         try:
