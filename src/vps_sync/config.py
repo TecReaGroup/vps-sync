@@ -28,8 +28,14 @@ class SyncSettings:
 
     @classmethod
     def from_env_file(cls, env_file: Path = DEFAULT_ENV_FILE) -> "SyncSettings":
-        """Load settings from an env file with process environment overrides."""
+        """Load directory paths from the env file and allow other environment overrides."""
         file_values = _read_env_file(env_file)
+        directory_paths = {}
+        for name in ("VPS_SYNC_LOCAL_DIRECTORY", "VPS_SYNC_REMOTE_DIRECTORY"):
+            value = file_values.get(name, "").strip()
+            if not value:
+                raise ConfigurationError(f"Missing required configuration: {name}")
+            directory_paths[name] = value
 
         def required(name: str) -> str:
             value = os.getenv(name, file_values.get(name, "")).strip()
@@ -38,8 +44,8 @@ class SyncSettings:
             return value
 
         return cls(
-            local_directory=Path(required("VPS_SYNC_LOCAL_DIRECTORY")).expanduser().resolve(),
-            remote_directory=required("VPS_SYNC_REMOTE_DIRECTORY"),
+            local_directory=Path(directory_paths["VPS_SYNC_LOCAL_DIRECTORY"]).expanduser().resolve(),
+            remote_directory=directory_paths["VPS_SYNC_REMOTE_DIRECTORY"],
             host=required("VPS_SYNC_HOST"),
             port=_parse_port(os.getenv("VPS_SYNC_PORT", file_values.get("VPS_SYNC_PORT", "22"))),
             username=required("VPS_SYNC_USERNAME"),
