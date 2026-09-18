@@ -16,6 +16,7 @@ def configure_logging(level: str) -> logging.Logger:
 
     console_output = logging.StreamHandler()
     console_output.setFormatter(formatter)
+    console_output.setLevel(logging.WARNING)
 
     log_file = LOG_DIRECTORY / f"log_{date.today().isoformat()}.log"
     persisted_output = logging.FileHandler(log_file, encoding="utf-8")
@@ -26,4 +27,5 @@ def configure_logging(level: str) -> logging.Logger:
     root_logger.addHandler(console_output)
     root_logger.addHandler(persisted_output)
     root_logger.setLevel(level)
+    logging.getLogger("paramiko").setLevel(logging.WARNING)
     return logging.getLogger("vps_sync")

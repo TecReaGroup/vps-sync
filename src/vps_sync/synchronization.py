@@ -3,8 +3,9 @@
 import errno
 import hashlib
 import logging
-import os
+import shlex
 import stat
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -13,10 +14,22 @@ from uuid import uuid4
 
 import paramiko
 from paramiko import SFTPAttributes, SFTPClient, SSHClient
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskID,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
 
 from vps_sync.config import SyncSettings
 
 HASH_CHUNK_SIZE = 1024 * 1024
+SFTP_PREFETCH_REQUESTS = 64
+REMOTE_CHECKSUM_WORKERS = 4
+REMOTE_CHECKSUM_BATCH_SIZE = 64
 TEMPORARY_FILE_MARKER = ".vps-sync-"
 TEMPORARY_FILE_SUFFIX = ".tmp"
 LOGGER = logging.getLogger("vps_sync.synchronization")
@@ -35,6 +48,63 @@ class SyncSummary:
     skipped_files: int
 
 
+@dataclass(frozen=True, slots=True)
+class SftpSession:
+    """Active SSH and SFTP clients sharing one authenticated transport."""
+
+    ssh: SSHClient
+    sftp: SFTPClient
+
+
+class TransferProgress:
+    """Update a transient terminal progress task from SFTP callbacks."""
+
+    def __init__(
+        self,
+        progress: Progress,
+        parent_task_id: TaskID,
+        action: str,
+        relative_path: str,
+    ) -> None:
+        self._progress = progress
+        self._parent_task_id = parent_task_id
+        progress.update(parent_task_id, visible=False)
+        self._task_id = progress.add_task(action, total=None, current=relative_path)
+        self._last_update_time = time.monotonic()
+
+    def __call__(self, transferred_bytes: int, total_bytes: int) -> None:
+        """Refresh the transfer task periodically and at completion."""
+        current_time = time.monotonic()
+        completed = total_bytes > 0 and transferred_bytes >= total_bytes
+        if not completed and current_time - self._last_update_time < 0.1:
+            return
+        self._progress.update(
+            self._task_id,
+            completed=transferred_bytes,
+            total=total_bytes or None,
+        )
+        self._last_update_time = current_time
+
+    def close(self) -> None:
+        """Remove the completed transfer task from the terminal."""
+        self._progress.remove_task(self._task_id)
+        self._progress.update(self._parent_task_id, visible=True)
+
+
+def create_terminal_progress() -> Progress:
+    """Create a transient progress display that never enters persistent logs."""
+    return Progress(
+        SpinnerColumn(),
+        TextColumn("{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        TextColumn("[dim]{task.fields[current]}"),
+        transient=True,
+        expand=True,
+    )
+
+
 class DirectorySynchronizer:
     """Synchronize one configured local and remote directory pair."""
 
@@ -50,23 +120,68 @@ class DirectorySynchronizer:
 
         scanned_files = 0
         transferred_files = 0
-        with self._open_sftp() as sftp:
+        with self._open_sftp() as session:
+            sftp = session.sftp
             remote_root = _resolve_remote_directory(sftp, self._settings.remote_directory)
             _create_remote_directory_tree(sftp, remote_root)
-
-            for local_file in _iter_local_files(local_root):
-                scanned_files += 1
-                relative_path = local_file.relative_to(local_root)
-                remote_file = remote_root.joinpath(*relative_path.parts)
-                local_md5 = _local_md5(local_file)
-                if _remote_md5_if_file(sftp, remote_file) == local_md5:
-                    LOGGER.info("Skipped unchanged upload: %s", relative_path)
-                    continue
-
-                _create_remote_directory_tree(sftp, remote_file.parent)
-                _upload_verified(sftp, local_file, remote_file, local_md5)
-                transferred_files += 1
-                LOGGER.info("Uploaded: %s", relative_path)
+            local_files = list(_iter_local_files(local_root))
+            with create_terminal_progress() as progress:
+                scan_task = progress.add_task(
+                    "Checking local files",
+                    total=len(local_files),
+                    current="",
+                )
+                try:
+                    total_batches = (
+                        len(local_files) + REMOTE_CHECKSUM_BATCH_SIZE - 1
+                    ) // REMOTE_CHECKSUM_BATCH_SIZE
+                    for offset in range(0, len(local_files), REMOTE_CHECKSUM_BATCH_SIZE):
+                        batch = local_files[offset : offset + REMOTE_CHECKSUM_BATCH_SIZE]
+                        batch_number = (offset // REMOTE_CHECKSUM_BATCH_SIZE) + 1
+                        batch_transferred_files = 0
+                        remote_files = [
+                            remote_root.joinpath(*local_file.relative_to(local_root).parts)
+                            for local_file in batch
+                        ]
+                        remote_digests = _remote_md5_for_files(
+                            session,
+                            remote_files,
+                            progress,
+                            scan_task,
+                            batch_number=batch_number,
+                            total_batches=total_batches,
+                        )
+                        for local_file, remote_file in zip(batch, remote_files, strict=True):
+                            scanned_files += 1
+                            relative_path = local_file.relative_to(local_root)
+                            progress.update(scan_task, current=str(relative_path))
+                            local_md5 = _local_md5(local_file)
+                            if remote_digests.get(remote_file) != local_md5:
+                                _create_remote_directory_tree(sftp, remote_file.parent)
+                                _upload_verified(
+                                    session,
+                                    local_file,
+                                    remote_file,
+                                    local_md5,
+                                    str(relative_path),
+                                    progress,
+                                    scan_task,
+                                )
+                                transferred_files += 1
+                                batch_transferred_files += 1
+                                LOGGER.info("Uploaded: %s", relative_path)
+                            progress.advance(scan_task)
+                        LOGGER.info(
+                            "Upload batch completed: batch=%d/%d scanned=%d transferred=%d "
+                            "skipped=%d",
+                            batch_number,
+                            total_batches,
+                            len(batch),
+                            batch_transferred_files,
+                            len(batch) - batch_transferred_files,
+                        )
+                finally:
+                    progress.remove_task(scan_task)
 
         return SyncSummary(
             scanned_files=scanned_files,
@@ -81,25 +196,75 @@ class DirectorySynchronizer:
 
         scanned_files = 0
         transferred_files = 0
-        with self._open_sftp() as sftp:
+        with self._open_sftp() as session:
+            sftp = session.sftp
             remote_root = _resolve_remote_directory(sftp, self._settings.remote_directory)
             if not _remote_directory_exists(sftp, remote_root):
                 raise SynchronizationError(
                     f"Remote download directory does not exist: {remote_root}"
                 )
+            with create_terminal_progress() as progress:
+                remote_files = _remote_file_list(session, remote_root, progress)
+                scan_task = progress.add_task(
+                    "Checking local files",
+                    total=len(remote_files),
+                    current="",
+                )
+                try:
+                    total_batches = (
+                        len(remote_files) + REMOTE_CHECKSUM_BATCH_SIZE - 1
+                    ) // REMOTE_CHECKSUM_BATCH_SIZE
+                    for offset in range(0, len(remote_files), REMOTE_CHECKSUM_BATCH_SIZE):
+                        batch = remote_files[offset : offset + REMOTE_CHECKSUM_BATCH_SIZE]
+                        batch_number = (offset // REMOTE_CHECKSUM_BATCH_SIZE) + 1
+                        batch_transferred_files = 0
+                        remote_digests = _remote_md5_for_files(
+                            session,
+                            batch,
+                            progress,
+                            scan_task,
+                            batch_number=batch_number,
+                            total_batches=total_batches,
+                        )
+                        for remote_file in batch:
+                            scanned_files += 1
+                            relative_path = remote_file.relative_to(remote_root)
+                            progress.update(scan_task, current=str(relative_path))
+                            local_file = local_root.joinpath(*relative_path.parts)
+                            try:
+                                remote_md5 = remote_digests[remote_file]
+                            except KeyError as error:
+                                raise SynchronizationError(
+                                    f"Remote file disappeared during checksum scan: {remote_file}"
+                                ) from error
+                            if local_file.is_file() and _local_md5(local_file) == remote_md5:
+                                progress.advance(scan_task)
+                                continue
 
-            for remote_file in _iter_remote_files(sftp, remote_root):
-                scanned_files += 1
-                relative_path = remote_file.relative_to(remote_root)
-                local_file = local_root.joinpath(*relative_path.parts)
-                remote_md5 = _remote_md5(sftp, remote_file)
-                if local_file.is_file() and _local_md5(local_file) == remote_md5:
-                    LOGGER.info("Skipped unchanged download: %s", relative_path)
-                    continue
-
-                _download_verified(sftp, remote_file, local_file, remote_md5)
-                transferred_files += 1
-                LOGGER.info("Downloaded: %s", relative_path)
+                            _download_verified(
+                                session,
+                                remote_file,
+                                local_file,
+                                remote_md5,
+                                str(relative_path),
+                                progress,
+                                scan_task,
+                            )
+                            transferred_files += 1
+                            batch_transferred_files += 1
+                            LOGGER.info("Downloaded: %s", relative_path)
+                            progress.advance(scan_task)
+                        LOGGER.info(
+                            "Download batch completed: batch=%d/%d scanned=%d transferred=%d "
+                            "skipped=%d",
+                            batch_number,
+                            total_batches,
+                            len(batch),
+                            batch_transferred_files,
+                            len(batch) - batch_transferred_files,
+                        )
+                finally:
+                    progress.remove_task(scan_task)
 
         return SyncSummary(
             scanned_files=scanned_files,
@@ -108,6 +273,7 @@ class DirectorySynchronizer:
         )
 
     @contextmanager
+<<<<<<< HEAD
     def _open_sftp(self) -> Iterator[SFTPClient]:
         """Open an SSH and SFTP session, accepting unknown host keys."""
         ssh_client = SSHClient()
@@ -118,6 +284,11 @@ class DirectorySynchronizer:
                     f"Known-hosts file does not exist: {self._settings.known_hosts_file}"
                 )
             ssh_client.load_host_keys(str(self._settings.known_hosts_file))
+=======
+    def _open_sftp(self) -> Iterator[SftpSession]:
+        """Open a password-authenticated SSH and SFTP session."""
+        ssh_client = SSHClient()
+>>>>>>> 1d5e7c88d18eb8402f52db874131b24acce784cc
         ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
         sftp: SFTPClient | None = None
@@ -134,7 +305,10 @@ class DirectorySynchronizer:
                 allow_agent=False,
             )
             sftp = ssh_client.open_sftp()
-            yield sftp
+            yield SftpSession(
+                ssh=ssh_client,
+                sftp=sftp,
+            )
         finally:
             if sftp is not None:
                 sftp.close()
@@ -152,24 +326,6 @@ def _iter_local_files(local_root: Path) -> Iterator[Path]:
             yield local_path
 
 
-def _iter_remote_files(sftp: SFTPClient, remote_root: PurePosixPath) -> Iterator[PurePosixPath]:
-    """Yield regular remote files recursively without following symbolic links."""
-    pending_directories = [remote_root]
-    while pending_directories:
-        remote_directory = pending_directories.pop()
-        entries = sorted(sftp.listdir_attr(str(remote_directory)), key=lambda entry: entry.filename)
-        for entry in entries:
-            remote_path = remote_directory / entry.filename
-            if _is_temporary_file_name(entry.filename):
-                LOGGER.warning("Skipped vps-sync temporary file: %s", remote_path)
-            elif stat.S_ISDIR(entry.st_mode):
-                pending_directories.append(remote_path)
-            elif stat.S_ISREG(entry.st_mode):
-                yield remote_path
-            else:
-                LOGGER.warning("Skipped non-regular remote path: %s", remote_path)
-
-
 def _local_md5(local_file: Path) -> str:
     """Calculate the MD5 digest of a local file."""
     digest = hashlib.md5(usedforsecurity=False)
@@ -179,39 +335,140 @@ def _local_md5(local_file: Path) -> str:
     return digest.hexdigest()
 
 
-def _remote_md5(sftp: SFTPClient, remote_file: PurePosixPath) -> str:
-    """Calculate the MD5 digest of a remote file through SFTP."""
-    digest = hashlib.md5(usedforsecurity=False)
-    with sftp.open(str(remote_file), "rb") as file_stream:
-        while chunk := file_stream.read(HASH_CHUNK_SIZE):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _remote_md5_if_file(sftp: SFTPClient, remote_file: PurePosixPath) -> str | None:
-    """Return a remote regular file digest, or None when it does not exist."""
+def _remote_md5(session: SftpSession, remote_file: PurePosixPath) -> str:
+    """Calculate a remote file digest on the VPS without transferring its content."""
+    command_output = _execute_remote_command(
+        session,
+        f"md5sum --zero -- {shlex.quote(str(remote_file))}",
+        f"Remote md5sum for {remote_file}",
+    )
+    digest_map = _parse_remote_md5_output(command_output)
     try:
-        attributes = sftp.stat(str(remote_file))
-    except OSError as error:
-        if error.errno == errno.ENOENT:
-            return None
-        raise
-    if not stat.S_ISREG(attributes.st_mode):
-        raise SynchronizationError(f"Remote destination is not a regular file: {remote_file}")
-    return _remote_md5(sftp, remote_file)
+        return digest_map[remote_file]
+    except KeyError as error:
+        raise SynchronizationError(f"Remote md5sum omitted {remote_file}") from error
+
+
+def _remote_file_list(
+    session: SftpSession,
+    remote_root: PurePosixPath,
+    progress: Progress,
+) -> list[PurePosixPath]:
+    """List remote regular files before processing them in checksum batches."""
+    list_task = progress.add_task("Listing remote files", total=None, current="")
+    command = f"find {shlex.quote(str(remote_root))} -type f -print0"
+    try:
+        command_output = _execute_remote_command(session, command, "Remote file listing")
+    finally:
+        progress.remove_task(list_task)
+    try:
+        remote_files = [
+            PurePosixPath(record.decode("utf-8"))
+            for record in command_output.split(b"\0")
+            if record
+        ]
+    except UnicodeError as error:
+        raise SynchronizationError("Remote file listing contains invalid UTF-8") from error
+    return sorted(
+        remote_file for remote_file in remote_files if not _is_temporary_file_name(remote_file.name)
+    )
+
+
+def _remote_md5_for_files(
+    session: SftpSession,
+    remote_files: list[PurePosixPath],
+    progress: Progress,
+    parent_task_id: TaskID,
+    batch_number: int,
+    total_batches: int,
+) -> dict[PurePosixPath, str]:
+    """Calculate digests for one upload batch and omit missing destinations."""
+    progress.update(parent_task_id, visible=False)
+    batch_task = progress.add_task(
+        f"Checking remote batch {batch_number}/{total_batches}",
+        total=None,
+        current=f"{len(remote_files)} files",
+    )
+    arguments = " ".join(shlex.quote(str(remote_file)) for remote_file in remote_files)
+    files_per_worker = max(1, len(remote_files) // REMOTE_CHECKSUM_WORKERS)
+    worker_script = (
+        'output_dir=$1; shift; for file do if [ -f "$file" ]; then '
+        'md5sum --zero -- "$file" || exit; elif [ -e "$file" ]; then '
+        "printf 'Remote destination is not a regular file: %s\\n' \"$file\" >&2; "
+        'exit 2; fi; done > "$output_dir/$$"'
+    )
+    command = (
+        "checksum_dir=$(mktemp -d); "
+        "trap 'rm -rf \"$checksum_dir\"' EXIT; "
+        f"printf '%s\\0' {arguments} | "
+        f"xargs -0 -r -n {files_per_worker} -P {REMOTE_CHECKSUM_WORKERS} "
+        f'sh -c {shlex.quote(worker_script)} sh "$checksum_dir"; '
+        'xargs_status=$?; if [ "$xargs_status" -ne 0 ]; then exit "$xargs_status"; fi; '
+        'find "$checksum_dir" -type f -exec cat {} +'
+    )
+    try:
+        command_output = _execute_remote_command(session, command, "Remote batch checksum")
+    finally:
+        progress.remove_task(batch_task)
+        progress.update(parent_task_id, visible=True)
+    return _parse_remote_md5_output(command_output)
+
+
+def _execute_remote_command(session: SftpSession, command: str, operation: str) -> bytes:
+    """Execute one remote command and require a successful exit status."""
+    command_input, command_output, command_error = session.ssh.exec_command(command)
+    command_input.close()
+    output_bytes = bytes(command_output.read())
+    error_text = command_error.read().decode("utf-8", errors="replace").strip()
+    exit_status = command_output.channel.recv_exit_status()
+    if exit_status != 0:
+        detail = error_text or f"exit status {exit_status}"
+        raise SynchronizationError(f"{operation} failed: {detail}")
+    return output_bytes
+
+
+def _parse_remote_md5_output(output_bytes: bytes) -> dict[PurePosixPath, str]:
+    """Parse null-delimited GNU md5sum output without filename ambiguity."""
+    digest_map: dict[PurePosixPath, str] = {}
+    for record in output_bytes.split(b"\0"):
+        if not record:
+            continue
+        if len(record) < 35 or record[32:34] not in {b"  ", b" *"}:
+            raise SynchronizationError("Remote md5sum returned malformed output")
+        try:
+            digest = record[:32].decode("ascii").lower()
+            int(digest, 16)
+            remote_file = PurePosixPath(record[34:].decode("utf-8"))
+        except (UnicodeError, ValueError) as error:
+            raise SynchronizationError("Remote md5sum returned malformed output") from error
+        digest_map[remote_file] = digest
+    return digest_map
 
 
 def _upload_verified(
-    sftp: SFTPClient,
+    session: SftpSession,
     local_file: Path,
     remote_file: PurePosixPath,
     expected_md5: str,
+    relative_path: str,
+    progress: Progress,
+    parent_task_id: TaskID,
 ) -> None:
     """Upload to a temporary remote file, verify it, then replace the target."""
+    sftp = session.sftp
     temporary_file = _temporary_remote_file(remote_file)
+    transfer_progress = TransferProgress(progress, parent_task_id, "Uploading", relative_path)
     try:
-        sftp.put(str(local_file), str(temporary_file), confirm=True)
-        if _remote_md5(sftp, temporary_file) != expected_md5:
+        try:
+            sftp.put(
+                str(local_file),
+                str(temporary_file),
+                callback=transfer_progress,
+                confirm=True,
+            )
+        finally:
+            transfer_progress.close()
+        if _remote_md5(session, temporary_file) != expected_md5:
             raise SynchronizationError(f"Uploaded file MD5 verification failed: {remote_file}")
         _replace_remote_file(sftp, temporary_file, remote_file)
     except Exception:
@@ -220,21 +477,35 @@ def _upload_verified(
 
 
 def _download_verified(
-    sftp: SFTPClient,
+    session: SftpSession,
     remote_file: PurePosixPath,
     local_file: Path,
     expected_md5: str,
+    relative_path: str,
+    progress: Progress,
+    parent_task_id: TaskID,
 ) -> None:
     """Download to a temporary local file, verify it, then replace the target."""
+    sftp = session.sftp
     local_file.parent.mkdir(parents=True, exist_ok=True)
     temporary_file = local_file.with_name(
         f".{local_file.name}{TEMPORARY_FILE_MARKER}{uuid4().hex}{TEMPORARY_FILE_SUFFIX}"
     )
+    transfer_progress = TransferProgress(progress, parent_task_id, "Downloading", relative_path)
     try:
-        sftp.get(str(remote_file), str(temporary_file))
+        try:
+            sftp.get(
+                str(remote_file),
+                str(temporary_file),
+                callback=transfer_progress,
+                prefetch=True,
+                max_concurrent_prefetch_requests=SFTP_PREFETCH_REQUESTS,
+            )
+        finally:
+            transfer_progress.close()
         if _local_md5(temporary_file) != expected_md5:
             raise SynchronizationError(f"Downloaded file MD5 verification failed: {remote_file}")
-        os.replace(temporary_file, local_file)
+        temporary_file.replace(local_file)
     finally:
         temporary_file.unlink(missing_ok=True)
 
@@ -304,8 +575,10 @@ def _temporary_remote_file(remote_file: PurePosixPath) -> PurePosixPath:
 
 def _is_temporary_file_name(file_name: str) -> bool:
     """Return whether a name belongs to an interrupted vps-sync transfer."""
-    return file_name.startswith(".") and TEMPORARY_FILE_MARKER in file_name and (
-        file_name.endswith(TEMPORARY_FILE_SUFFIX) or file_name.endswith(".backup")
+    return (
+        file_name.startswith(".")
+        and TEMPORARY_FILE_MARKER in file_name
+        and (file_name.endswith((TEMPORARY_FILE_SUFFIX, ".backup")))
     )
 
 

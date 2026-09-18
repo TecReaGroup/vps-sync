@@ -5,7 +5,7 @@ import logging
 from collections.abc import Sequence
 from pathlib import Path
 
-from paramiko import AuthenticationException, BadHostKeyException, SSHException
+from paramiko import AuthenticationException, SSHException
 
 from vps_sync import __version__
 from vps_sync.config import DEFAULT_ENV_FILE, ConfigurationError, SyncSettings
@@ -41,9 +41,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         configure_logging(settings.log_level)
         synchronizer = DirectorySynchronizer(settings)
         summary = (
-            synchronizer.upload()
-            if arguments.direction == "upload"
-            else synchronizer.download()
+            synchronizer.upload() if arguments.direction == "upload" else synchronizer.download()
         )
     except (ConfigurationError, SynchronizationError) as error:
         logging.basicConfig(level=logging.ERROR, format="[%(levelname)s] %(message)s")
@@ -52,9 +50,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     except AuthenticationException:
         LOGGER.error("SSH authentication failed")
         return 3
-    except BadHostKeyException as error:
-        LOGGER.error("SSH host key verification failed: %s", error)
-        return 4
     except SSHException as error:
         LOGGER.error("SSH connection failed: %s", error)
         return 5
