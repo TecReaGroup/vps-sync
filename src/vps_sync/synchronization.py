@@ -113,7 +113,7 @@ class DirectorySynchronizer:
         self._settings = settings
 
     def upload(self) -> SyncSummary:
-        """Upload new and changed local files to the remote directory."""
+        """Upload changed files and optionally remove remote-only entries."""
         local_root = self._settings.local_directory
         if not local_root.is_dir():
             raise SynchronizationError(f"Local upload directory does not exist: {local_root}")
@@ -125,6 +125,16 @@ class DirectorySynchronizer:
             remote_root = _resolve_remote_directory(sftp, self._settings.remote_directory)
             _create_remote_directory_tree(sftp, remote_root)
             local_files = list(_iter_local_files(local_root))
+            local_directories = {
+                path.relative_to(local_root)
+                for path in local_root.rglob("*")
+                if path.is_dir() and not path.is_symlink()
+            }
+            if self._settings.overwrite:
+                for relative_directory in sorted(local_directories):
+                    _create_remote_directory_tree(
+                        sftp, remote_root.joinpath(*relative_directory.parts)
+                    )
             with create_terminal_progress() as progress:
                 scan_task = progress.add_task(
                     "Checking local files",
@@ -183,6 +193,12 @@ class DirectorySynchronizer:
                 finally:
                     progress.remove_task(scan_task)
 
+            if self._settings.overwrite:
+                expected_paths = {
+                    PurePosixPath(*path.relative_to(local_root).parts) for path in local_files
+                } | {PurePosixPath(*path.parts) for path in local_directories}
+                _remove_remote_extras(sftp, remote_root, expected_paths)
+
         return SyncSummary(
             scanned_files=scanned_files,
             transferred_files=transferred_files,
@@ -190,7 +206,7 @@ class DirectorySynchronizer:
         )
 
     def download(self) -> SyncSummary:
-        """Download new and changed remote files to the local directory."""
+        """Download changed files and optionally remove local-only entries."""
         local_root = self._settings.local_directory
         local_root.mkdir(parents=True, exist_ok=True)
 
@@ -205,6 +221,14 @@ class DirectorySynchronizer:
                 )
             with create_terminal_progress() as progress:
                 remote_files = _remote_file_list(session, remote_root, progress)
+                remote_directories = []
+                if self._settings.overwrite:
+                    remote_directories = _remote_directory_list(session, remote_root)
+                    for remote_directory in remote_directories:
+                        relative_directory = remote_directory.relative_to(remote_root)
+                        local_root.joinpath(*relative_directory.parts).mkdir(
+                            parents=True, exist_ok=True
+                        )
                 scan_task = progress.add_task(
                     "Checking local files",
                     total=len(remote_files),
@@ -266,6 +290,13 @@ class DirectorySynchronizer:
                 finally:
                     progress.remove_task(scan_task)
 
+            if self._settings.overwrite:
+                expected_paths = {
+                    Path(*path.relative_to(remote_root).parts)
+                    for path in [*remote_files, *remote_directories]
+                }
+                _remove_local_extras(local_root, expected_paths)
+
         return SyncSummary(
             scanned_files=scanned_files,
             transferred_files=transferred_files,
@@ -311,6 +342,60 @@ def _iter_local_files(local_root: Path) -> Iterator[Path]:
             LOGGER.warning("Skipped local symbolic link: %s", local_path)
         elif local_path.is_file():
             yield local_path
+
+
+def _remove_remote_extras(
+    sftp: SFTPClient,
+    remote_root: PurePosixPath,
+    expected_paths: set[PurePosixPath],
+) -> None:
+    """Remove destination-only entries without following remote symbolic links."""
+
+    def clean_directory(directory: PurePosixPath) -> None:
+        for entry in sftp.listdir_attr(str(directory)):
+            remote_path = directory / entry.filename
+            relative_path = remote_path.relative_to(remote_root)
+            if stat.S_ISDIR(entry.st_mode or 0):
+                clean_directory(remote_path)
+                if relative_path not in expected_paths:
+                    sftp.rmdir(str(remote_path))
+                    LOGGER.info("Deleted remote directory: %s", relative_path)
+            elif relative_path not in expected_paths:
+                sftp.remove(str(remote_path))
+                LOGGER.info("Deleted remote file: %s", relative_path)
+
+    clean_directory(remote_root)
+
+
+def _remove_local_extras(local_root: Path, expected_paths: set[Path]) -> None:
+    """Remove destination-only entries from leaves to root without following links."""
+    for local_path in sorted(local_root.rglob("*"), key=lambda path: len(path.parts), reverse=True):
+        relative_path = local_path.relative_to(local_root)
+        if relative_path in expected_paths:
+            continue
+        if local_path.is_dir() and not local_path.is_symlink():
+            local_path.rmdir()
+            LOGGER.info("Deleted local directory: %s", relative_path)
+        else:
+            local_path.unlink()
+            LOGGER.info("Deleted local file: %s", relative_path)
+
+
+def _remote_directory_list(session: SftpSession, remote_root: PurePosixPath) -> list[PurePosixPath]:
+    """List source directories, including empty ones, for mirror synchronization."""
+    command_output = _execute_remote_command(
+        session,
+        f"find {shlex.quote(str(remote_root))} -mindepth 1 -type d -print0",
+        "Remote directory listing",
+    )
+    try:
+        return sorted(
+            PurePosixPath(record.decode("utf-8"))
+            for record in command_output.split(b"\0")
+            if record
+        )
+    except UnicodeError as error:
+        raise SynchronizationError("Remote directory listing contains invalid UTF-8") from error
 
 
 def _local_md5(local_file: Path) -> str:

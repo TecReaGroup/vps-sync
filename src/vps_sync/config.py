@@ -1,10 +1,13 @@
 """Runtime configuration loaded from an environment file."""
 
 import os
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
 DEFAULT_ENV_FILE = Path(".env")
+DEFAULT_CONFIG_FILE = Path("config/config.toml")
+DEFAULT_OVERWRITE = True
 DEFAULT_LOG_LEVEL = "INFO"
 VALID_LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
 
@@ -25,6 +28,7 @@ class SyncSettings:
     password: str
     connection_timeout_seconds: float
     log_level: str
+    overwrite: bool = DEFAULT_OVERWRITE
 
     @classmethod
     def from_env_file(cls, env_file: Path = DEFAULT_ENV_FILE) -> "SyncSettings":
@@ -44,6 +48,7 @@ class SyncSettings:
             return value
 
         return cls(
+            overwrite=_read_overwrite_setting(DEFAULT_CONFIG_FILE),
             local_directory=Path(directory_paths["VPS_SYNC_LOCAL_DIRECTORY"]).expanduser().resolve(),
             remote_directory=directory_paths["VPS_SYNC_REMOTE_DIRECTORY"],
             host=required("VPS_SYNC_HOST"),
@@ -63,6 +68,21 @@ class SyncSettings:
                 )
             ),
         )
+
+
+def _read_overwrite_setting(config_file: Path) -> bool:
+    """Load the overwrite setting, defaulting to true when omitted."""
+    try:
+        with config_file.open("rb") as config_stream:
+            configuration = tomllib.load(config_stream)
+    except FileNotFoundError:
+        return DEFAULT_OVERWRITE
+    except tomllib.TOMLDecodeError as error:
+        raise ConfigurationError(f"Invalid TOML configuration in {config_file}: {error}") from error
+    overwrite = configuration.get("overwrite", DEFAULT_OVERWRITE)
+    if not isinstance(overwrite, bool):
+        raise ConfigurationError(f"overwrite must be a boolean in {config_file}")
+    return overwrite
 
 
 def _read_env_file(env_file: Path) -> dict[str, str]:
