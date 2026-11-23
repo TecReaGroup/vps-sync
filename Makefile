@@ -7,8 +7,8 @@ install:
 	@test -f "$(ENV_FILE)" || cp .env.example "$(ENV_FILE)"
 	$(UV) sync --locked
 
-upload:
-	$(UV) run vps-sync --env-file "$(ENV_FILE)" upload
-
 download:
 	$(UV) run vps-sync --env-file "$(ENV_FILE)" download
+
+upload:
+	$(UV) run vps-sync --env-file "$(ENV_FILE)" upload
