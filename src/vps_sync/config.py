@@ -5,8 +5,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 DEFAULT_ENV_FILE = Path(".env")
-DEFAULT_LOG_LEVEL = "INFO"
-VALID_LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
 
 
 class ConfigurationError(ValueError):
@@ -23,8 +21,6 @@ class SyncSettings:
     port: int
     username: str
     password: str
-    connection_timeout_seconds: float
-    log_level: str
 
     @classmethod
     def from_env_file(cls, env_file: Path = DEFAULT_ENV_FILE) -> "SyncSettings":
@@ -50,18 +46,6 @@ class SyncSettings:
             port=_parse_port(os.getenv("VPS_SYNC_PORT", file_values.get("VPS_SYNC_PORT", "22"))),
             username=required("VPS_SYNC_USERNAME"),
             password=required("VPS_SYNC_PASSWORD"),
-            connection_timeout_seconds=_parse_timeout(
-                os.getenv(
-                    "VPS_SYNC_CONNECTION_TIMEOUT_SECONDS",
-                    file_values.get("VPS_SYNC_CONNECTION_TIMEOUT_SECONDS", "30"),
-                )
-            ),
-            log_level=_parse_log_level(
-                os.getenv(
-                    "VPS_SYNC_LOG_LEVEL",
-                    file_values.get("VPS_SYNC_LOG_LEVEL", DEFAULT_LOG_LEVEL),
-                )
-            ),
         )
 
 
@@ -101,23 +85,3 @@ def _parse_port(raw_port: str) -> int:
     if not 1 <= port <= 65535:
         raise ConfigurationError("VPS_SYNC_PORT must be between 1 and 65535")
     return port
-
-
-def _parse_timeout(raw_timeout: str) -> float:
-    """Parse and validate the SSH connection timeout."""
-    try:
-        timeout = float(raw_timeout)
-    except ValueError as error:
-        raise ConfigurationError("VPS_SYNC_CONNECTION_TIMEOUT_SECONDS must be a number") from error
-    if timeout <= 0:
-        raise ConfigurationError("VPS_SYNC_CONNECTION_TIMEOUT_SECONDS must be positive")
-    return timeout
-
-
-def _parse_log_level(raw_log_level: str) -> str:
-    """Parse and validate the application log level."""
-    log_level = raw_log_level.upper()
-    if log_level not in VALID_LOG_LEVELS:
-        allowed_levels = ", ".join(sorted(VALID_LOG_LEVELS))
-        raise ConfigurationError(f"VPS_SYNC_LOG_LEVEL must be one of: {allowed_levels}")
-    return log_level

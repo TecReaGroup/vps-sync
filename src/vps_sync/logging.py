@@ -5,11 +5,12 @@ from datetime import date
 from pathlib import Path
 
 LOG_DIRECTORY = Path("log")
+LOG_LEVEL = logging.INFO
 LOG_FORMAT = "[%(asctime)s] [%(levelname)s] [%(name)s] - %(message)s"
 LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
-def configure_logging(level: str) -> logging.Logger:
+def configure_logging() -> logging.Logger:
     """Configure console and date-based file logging."""
     LOG_DIRECTORY.mkdir(parents=True, exist_ok=True)
     formatter = logging.Formatter(LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
@@ -26,6 +27,6 @@ def configure_logging(level: str) -> logging.Logger:
     root_logger.handlers.clear()
     root_logger.addHandler(console_output)
     root_logger.addHandler(persisted_output)
-    root_logger.setLevel(level)
+    root_logger.setLevel(LOG_LEVEL)
     logging.getLogger("paramiko").setLevel(logging.WARNING)
     return logging.getLogger("vps_sync")

@@ -10,7 +10,8 @@ from paramiko import AuthenticationException, SSHException
 from vps_sync import __version__
 from vps_sync.config import DEFAULT_ENV_FILE, ConfigurationError, SyncSettings
 from vps_sync.logging import configure_logging
-from vps_sync.synchronization import DirectorySynchronizer, SynchronizationError
+from vps_sync.synchronization import DirectorySynchronizer
+from vps_sync.tree import SynchronizationError
 
 LOGGER = logging.getLogger("vps_sync.cli")
 
@@ -32,15 +33,24 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def confirm_on_terminal(question: str) -> bool:
+    """Ask a yes/no question; non-interactive input counts as no."""
+    try:
+        answer = input(f"{question} Continue? [y/N] ")
+    except EOFError:
+        return False
+    return answer.strip().lower() in {"y", "yes"}
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run one upload or download synchronization."""
     arguments = build_parser().parse_args(argv)
 
     try:
         settings = SyncSettings.from_env_file(arguments.env_file)
-        configure_logging(settings.log_level)
+        configure_logging()
         LOGGER.info("Synchronization started: direction=%s", arguments.direction)
-        synchronizer = DirectorySynchronizer(settings)
+        synchronizer = DirectorySynchronizer(settings, confirm_on_terminal)
         summary = (
             synchronizer.upload() if arguments.direction == "upload" else synchronizer.download()
         )
@@ -59,9 +69,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 6
 
     LOGGER.info(
-        "Synchronization completed: scanned=%d transferred=%d skipped=%d",
-        summary.scanned_files,
+        "Synchronization completed: source_files=%d transferred=%d skipped=%d deleted=%d",
+        summary.source_files,
         summary.transferred_files,
         summary.skipped_files,
+        summary.deleted_entries,
     )
     return 0
