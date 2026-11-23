@@ -1,4 +1,4 @@
-"""VPS directory synchronization package."""
+"""VPS directory synchronization package"""
 
 from importlib.metadata import PackageNotFoundError, version
 

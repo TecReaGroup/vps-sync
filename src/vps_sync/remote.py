@@ -2,7 +2,7 @@
 
 Bulk operations stream NUL-delimited relative paths through stdin so command
 lines stay short regardless of how many files are involved. GNU coreutils and
-findutils are required on the VPS.
+findutils are required on the VPS
 """
 
 import logging
@@ -26,7 +26,7 @@ LOGGER = logging.getLogger("vps_sync.remote")
 
 @dataclass(frozen=True, slots=True)
 class SftpSession:
-    """Active SSH and SFTP clients sharing one authenticated transport."""
+    """Active SSH and SFTP clients sharing one authenticated transport"""
 
     ssh: SSHClient
     sftp: SFTPClient
@@ -34,7 +34,7 @@ class SftpSession:
 
 @contextmanager
 def open_sftp_session(settings: SyncSettings) -> Iterator[SftpSession]:
-    """Open a password-authenticated SSH and SFTP session."""
+    """Open a password-authenticated SSH and SFTP session"""
     ssh_client = SSHClient()
     ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     sftp: SFTPClient | None = None
@@ -64,7 +64,7 @@ def run_remote_command(
     operation: str,
     stdin_payload: bytes = b"",
 ) -> bytes:
-    """Execute one remote command, feed it stdin, and require a zero exit status."""
+    """Execute one remote command, feed it stdin, and require a zero exit status"""
     command_input, command_output, command_error = ssh.exec_command(command)
     if stdin_payload:
         command_input.channel.sendall(stdin_payload)
@@ -79,7 +79,7 @@ def run_remote_command(
 
 
 def resolve_remote_root(sftp: SFTPClient, configured_path: str) -> PurePosixPath:
-    """Resolve absolute, relative, and current-user home remote paths."""
+    """Resolve absolute, relative, and current-user home remote paths"""
     remote_home = PurePosixPath(sftp.normalize("."))
     if configured_path == "~":
         return remote_home
@@ -103,7 +103,7 @@ def _decode_path(raw_path: bytes) -> PurePosixPath:
 
 
 def _parse_md5_output(output_bytes: bytes) -> dict[PurePosixPath, str]:
-    """Parse GNU ``md5sum --zero`` output, which never escapes file names."""
+    """Parse GNU ``md5sum --zero`` output, which never escapes file names"""
     digests: dict[PurePosixPath, str] = {}
     for record in output_bytes.split(b"\0"):
         if not record:
@@ -120,7 +120,7 @@ def _parse_md5_output(output_bytes: bytes) -> dict[PurePosixPath, str]:
 
 
 class RemoteTree:
-    """The remote synchronization root, operated through bulk shell commands."""
+    """The remote synchronization root, operated through bulk shell commands"""
 
     def __init__(self, session: SftpSession, root: PurePosixPath) -> None:
         self.root = root
@@ -129,11 +129,11 @@ class RemoteTree:
         self._quoted_root = shlex.quote(str(root))
 
     def ensure_root(self) -> None:
-        """Create the remote root and its parents when missing."""
+        """Create the remote root and its parents when missing"""
         run_remote_command(self._ssh, f"mkdir -p -- {self._quoted_root}", "Remote root creation")
 
     def snapshot(self) -> TreeSnapshot:
-        """List every entry below the root with one ``find`` call."""
+        """List every entry below the root with one ``find`` call"""
         command = (
             f"[ -d {self._quoted_root} ] || {{ printf 'Remote directory does not exist: %s\\n' "
             f"{self._quoted_root} >&2; exit 1; }}; "
@@ -143,7 +143,7 @@ class RemoteTree:
         file_sizes: dict[PurePosixPath, int] = {}
         directories: set[PurePosixPath] = set()
         unsupported: set[PurePosixPath] = set()
-        # Records are (type, size, relative path) triples followed by one trailing empty field.
+        # Records are (type, size, relative path) triples followed by one trailing empty field
         for offset in range(0, len(fields) - 1, 3):
             entry_type, raw_size, raw_path = fields[offset : offset + 3]
             relative_path = _decode_path(raw_path)
@@ -160,9 +160,9 @@ class RemoteTree:
         paths: list[PurePosixPath],
         on_hashed: Callable[[int], None],
     ) -> dict[PurePosixPath, str]:
-        """Hash files on the VPS in batches; ``on_hashed`` receives each batch size."""
+        """Hash files on the VPS in batches; ``on_hashed`` receives each batch size"""
         # Each md5sum worker writes to its own file because concurrent writers to one
-        # pipe could interleave records that exceed PIPE_BUF.
+        # pipe could interleave records that exceed PIPE_BUF
         worker_script = shlex.quote('exec md5sum --zero -- "$@" > "$0/$$"')
         digests: dict[PurePosixPath, str] = {}
         for offset in range(0, len(paths), REMOTE_HASH_BATCH_SIZE):
@@ -187,7 +187,7 @@ class RemoteTree:
         return digests
 
     def remove(self, files: list[PurePosixPath], directories: list[PurePosixPath]) -> None:
-        """Delete files first, then directories in the given deepest-first order."""
+        """Delete files first, then directories in the given deepest-first order"""
         if files:
             run_remote_command(
                 self._ssh,
@@ -208,7 +208,7 @@ class RemoteTree:
                 LOGGER.info("Deleted remote directory: %s", relative_path)
 
     def create_directories(self, directories: list[PurePosixPath]) -> None:
-        """Create directories and any missing parents with one command."""
+        """Create directories and any missing parents with one command"""
         if directories:
             run_remote_command(
                 self._ssh,

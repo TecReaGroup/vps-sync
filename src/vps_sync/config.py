@@ -1,19 +1,21 @@
-"""Runtime configuration loaded from an environment file."""
+"""Runtime configuration loaded from an environment file"""
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
 DEFAULT_ENV_FILE = Path(".env")
+DEFAULT_PORT = "22"
 
 
 class ConfigurationError(ValueError):
-    """Raised when required synchronization configuration is invalid."""
+    """Raised when required synchronization configuration is invalid"""
 
 
 @dataclass(frozen=True, slots=True)
 class SyncSettings:
-    """Validated settings for one local and remote directory pair."""
+    """Validated settings for one local and remote directory pair"""
 
     local_directory: Path
     remote_directory: str
@@ -24,33 +26,22 @@ class SyncSettings:
 
     @classmethod
     def from_env_file(cls, env_file: Path = DEFAULT_ENV_FILE) -> "SyncSettings":
-        """Load directory paths from the env file and allow other environment overrides."""
+        """Read directory paths from the env file only; process environment overrides the rest"""
         file_values = _read_env_file(env_file)
-        directory_paths = {}
-        for name in ("VPS_SYNC_LOCAL_DIRECTORY", "VPS_SYNC_REMOTE_DIRECTORY"):
-            value = file_values.get(name, "").strip()
-            if not value:
-                raise ConfigurationError(f"Missing required configuration: {name}")
-            directory_paths[name] = value
-
-        def required(name: str) -> str:
-            value = os.getenv(name, file_values.get(name, "")).strip()
-            if not value:
-                raise ConfigurationError(f"Missing required configuration: {name}")
-            return value
-
+        overridable_values = {**file_values, **os.environ}
+        local_directory = _require(file_values, "VPS_SYNC_LOCAL_DIRECTORY")
         return cls(
-            local_directory=Path(directory_paths["VPS_SYNC_LOCAL_DIRECTORY"]).expanduser().resolve(),
-            remote_directory=directory_paths["VPS_SYNC_REMOTE_DIRECTORY"],
-            host=required("VPS_SYNC_HOST"),
-            port=_parse_port(os.getenv("VPS_SYNC_PORT", file_values.get("VPS_SYNC_PORT", "22"))),
-            username=required("VPS_SYNC_USERNAME"),
-            password=required("VPS_SYNC_PASSWORD"),
+            local_directory=Path(local_directory).expanduser().resolve(),
+            remote_directory=_require(file_values, "VPS_SYNC_REMOTE_DIRECTORY"),
+            host=_require(overridable_values, "VPS_SYNC_HOST"),
+            port=_parse_port(overridable_values.get("VPS_SYNC_PORT", DEFAULT_PORT)),
+            username=_require(overridable_values, "VPS_SYNC_USERNAME"),
+            password=_require(overridable_values, "VPS_SYNC_PASSWORD"),
         )
 
 
 def _read_env_file(env_file: Path) -> dict[str, str]:
-    """Parse simple KEY=VALUE entries from an env file."""
+    """Parse simple KEY=VALUE entries from an env file"""
     if not env_file.is_file():
         raise ConfigurationError(f"Environment file does not exist: {env_file}")
 
@@ -70,14 +61,20 @@ def _read_env_file(env_file: Path) -> dict[str, str]:
 
 
 def _unquote(value: str) -> str:
-    """Remove matching single or double quotes from an env value."""
+    """Remove matching single or double quotes from an env value"""
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
         return value[1:-1]
     return value
 
 
+def _require(values: Mapping[str, str], name: str) -> str:
+    value = values.get(name, "").strip()
+    if not value:
+        raise ConfigurationError(f"Missing required configuration: {name}")
+    return value
+
+
 def _parse_port(raw_port: str) -> int:
-    """Parse and validate an SSH port."""
     try:
         port = int(raw_port)
     except ValueError as error:

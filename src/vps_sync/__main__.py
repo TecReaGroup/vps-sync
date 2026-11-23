@@ -1,4 +1,4 @@
-"""Allow the package to run with ``python -m vps_sync``."""
+"""Allow the package to run with ``python -m vps_sync``"""
 
 from vps_sync.cli import main
 

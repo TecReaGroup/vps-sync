@@ -38,26 +38,8 @@ Thumbs.db
 temp/*
 !temp/.gitkeep
 
-# Keep directory placeholders if they are added to the repository.
-!data/**/.gitkeep
-
-# Large local audio/model assets and generated outputs
-data/audio/*
-!data/audio/.gitkeep
-data/model/*
-!data/model/.gitkeep
-data/stem/*
-!data/stem/.gitkeep
-data/stem_gated/*
-!data/stem_gated/.gitkeep
-data/midi/*
-!data/midi/.gitkeep
-data/midi_fixed/*
-!data/midi_fixed/.gitkeep
-data/log/*
-!data/log/.gitkeep
-
-*.mid
-*.mp3
-*.wav
-*.m4a
+# Runtime data and logs keep only their directory placeholders
+data/*
+!data/.gitkeep
+log/*
+!log/.gitkeep

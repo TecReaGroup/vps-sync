@@ -1,7 +1,7 @@
 """Mirror synchronization between the local and remote directories.
 
 Flow: snapshot both trees -> plan -> hash only same-size files -> delete extras
--> create directories -> transfer over parallel SSH connections.
+-> create directories -> transfer over parallel SSH connections
 """
 
 import errno
@@ -52,7 +52,7 @@ TransferFile = Callable[[SftpSession, PurePosixPath, str, Callable[[int], None]]
 
 
 class DirectoryTree(Protocol):
-    """Operations the mirror algorithm needs from either side."""
+    """Operations the mirror algorithm needs from either side"""
 
     label: str
 
@@ -69,7 +69,7 @@ class DirectoryTree(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class SyncSummary:
-    """Counts collected during one synchronization operation."""
+    """Counts collected during one synchronization operation"""
 
     source_files: int
     transferred_files: int
@@ -78,7 +78,7 @@ class SyncSummary:
 
 
 def create_terminal_progress() -> Progress:
-    """Create a transient progress display that never enters persistent logs."""
+    """Create a transient progress display that never enters persistent logs"""
     return Progress(
         SpinnerColumn(),
         TextColumn("{task.description}"),
@@ -92,15 +92,15 @@ def create_terminal_progress() -> Progress:
 
 
 class DirectorySynchronizer:
-    """Mirror one configured local and remote directory pair."""
+    """Mirror one configured local and remote directory pair"""
 
     def __init__(self, settings: SyncSettings, confirm_empty_source: ConfirmEmptySource) -> None:
-        """Store settings and the prompt used before mirroring an empty source."""
+        """Store settings and the prompt used before mirroring an empty source"""
         self._settings = settings
         self._confirm_empty_source = confirm_empty_source
 
     def upload(self) -> SyncSummary:
-        """Make the remote directory an exact mirror of the local directory."""
+        """Make the remote directory an exact mirror of the local directory"""
         local_tree = LocalTree(self._settings.local_directory)
         if not local_tree.root.is_dir():
             raise SynchronizationError(f"Local upload directory does not exist: {local_tree.root}")
@@ -112,7 +112,7 @@ class DirectorySynchronizer:
             return self._mirror(local_tree, remote_tree, upload, "Uploading")
 
     def download(self) -> SyncSummary:
-        """Make the local directory an exact mirror of the remote directory."""
+        """Make the local directory an exact mirror of the remote directory"""
         local_tree = LocalTree(self._settings.local_directory)
         local_tree.root.mkdir(parents=True, exist_ok=True)
         with open_sftp_session(self._settings) as session:
@@ -159,7 +159,7 @@ class DirectorySynchronizer:
         )
 
         with create_terminal_progress() as progress:
-            # Source digests of changed files are the integrity reference for their transfer.
+            # Source digests of changed files are the integrity reference for their transfer
             source_digests, target_digests = _hash_both_sides(
                 source,
                 plan.changed_files + plan.same_size_files,
@@ -202,7 +202,7 @@ class DirectorySynchronizer:
         transfer_action: str,
         progress: Progress,
     ) -> None:
-        """Transfer files over independent SSH connections; the first failure stops all."""
+        """Transfer files over independent SSH connections; the first failure stops all"""
         if not paths:
             return
         pending_paths: queue.SimpleQueue[PurePosixPath] = queue.SimpleQueue()
@@ -249,7 +249,7 @@ def _hash_both_sides(
     target_paths: list[PurePosixPath],
     progress: Progress,
 ) -> tuple[dict[PurePosixPath, str], dict[PurePosixPath, str]]:
-    """Hash the local and remote sides concurrently."""
+    """Hash the local and remote sides concurrently"""
     source_task = progress.add_task(f"Hashing {source.label}", total=len(source_paths), current="")
     target_task = progress.add_task(f"Hashing {target.label}", total=len(target_paths), current="")
     try:
@@ -265,7 +265,7 @@ def _hash_both_sides(
 
 
 class _CumulativeByteCounter:
-    """Convert paramiko's cumulative callback into byte deltas."""
+    """Convert paramiko's cumulative callback into byte deltas"""
 
     def __init__(self, on_bytes: Callable[[int], None]) -> None:
         self._on_bytes = on_bytes
@@ -285,7 +285,7 @@ def _upload_file(
     local_tree: LocalTree,
     remote_root: PurePosixPath,
 ) -> None:
-    """Upload to a temporary file, then verify and rename it in one remote command."""
+    """Upload to a temporary file, then verify and rename it in one remote command"""
     remote_file = remote_root / relative_path
     temporary_file = remote_file.with_name(temporary_file_name(remote_file.name))
     verify_and_replace = (
@@ -316,7 +316,7 @@ def _download_file(
     local_tree: LocalTree,
     remote_root: PurePosixPath,
 ) -> None:
-    """Download to a temporary file while hashing, then verify and replace the target."""
+    """Download to a temporary file while hashing, then verify and replace the target"""
     local_file = local_tree.path_of(relative_path)
     temporary_file = local_file.with_name(temporary_file_name(local_file.name))
     digest = hashlib.md5(usedforsecurity=False)

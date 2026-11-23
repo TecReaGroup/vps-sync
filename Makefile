@@ -5,7 +5,7 @@ ENV_FILE ?= .env
 
 install:
 	@test -f "$(ENV_FILE)" || cp .env.example "$(ENV_FILE)"
-	$(UV) sync --locked
+	$(UV) sync --locked --managed-python
 
 download:
 	$(UV) run vps-sync --env-file "$(ENV_FILE)" download
