@@ -113,7 +113,7 @@ class DirectorySynchronizer:
         self._settings = settings
 
     def upload(self) -> SyncSummary:
-        """Upload changed files and optionally remove remote-only entries."""
+        """Mirror the local directory to the remote directory."""
         local_root = self._settings.local_directory
         if not local_root.is_dir():
             raise SynchronizationError(f"Local upload directory does not exist: {local_root}")
@@ -130,11 +130,8 @@ class DirectorySynchronizer:
                 for path in local_root.rglob("*")
                 if path.is_dir() and not path.is_symlink()
             }
-            if self._settings.overwrite:
-                for relative_directory in sorted(local_directories):
-                    _create_remote_directory_tree(
-                        sftp, remote_root.joinpath(*relative_directory.parts)
-                    )
+            for relative_directory in sorted(local_directories):
+                _create_remote_directory_tree(sftp, remote_root.joinpath(*relative_directory.parts))
             with create_terminal_progress() as progress:
                 scan_task = progress.add_task(
                     "Checking local files",
@@ -193,11 +190,10 @@ class DirectorySynchronizer:
                 finally:
                     progress.remove_task(scan_task)
 
-            if self._settings.overwrite:
-                expected_paths = {
-                    PurePosixPath(*path.relative_to(local_root).parts) for path in local_files
-                } | {PurePosixPath(*path.parts) for path in local_directories}
-                _remove_remote_extras(sftp, remote_root, expected_paths)
+            expected_paths = {
+                PurePosixPath(*path.relative_to(local_root).parts) for path in local_files
+            } | {PurePosixPath(*path.parts) for path in local_directories}
+            _remove_remote_extras(sftp, remote_root, expected_paths)
 
         return SyncSummary(
             scanned_files=scanned_files,
@@ -206,7 +202,7 @@ class DirectorySynchronizer:
         )
 
     def download(self) -> SyncSummary:
-        """Download changed files and optionally remove local-only entries."""
+        """Mirror the remote directory to the local directory."""
         local_root = self._settings.local_directory
         local_root.mkdir(parents=True, exist_ok=True)
 
@@ -221,14 +217,12 @@ class DirectorySynchronizer:
                 )
             with create_terminal_progress() as progress:
                 remote_files = _remote_file_list(session, remote_root, progress)
-                remote_directories = []
-                if self._settings.overwrite:
-                    remote_directories = _remote_directory_list(session, remote_root)
-                    for remote_directory in remote_directories:
-                        relative_directory = remote_directory.relative_to(remote_root)
-                        local_root.joinpath(*relative_directory.parts).mkdir(
-                            parents=True, exist_ok=True
-                        )
+                remote_directories = _remote_directory_list(session, remote_root)
+                for remote_directory in remote_directories:
+                    relative_directory = remote_directory.relative_to(remote_root)
+                    local_root.joinpath(*relative_directory.parts).mkdir(
+                        parents=True, exist_ok=True
+                    )
                 scan_task = progress.add_task(
                     "Checking local files",
                     total=len(remote_files),
@@ -290,12 +284,11 @@ class DirectorySynchronizer:
                 finally:
                     progress.remove_task(scan_task)
 
-            if self._settings.overwrite:
-                expected_paths = {
-                    Path(*path.relative_to(remote_root).parts)
-                    for path in [*remote_files, *remote_directories]
-                }
-                _remove_local_extras(local_root, expected_paths)
+            expected_paths = {
+                Path(*path.relative_to(remote_root).parts)
+                for path in [*remote_files, *remote_directories]
+            }
+            _remove_local_extras(local_root, expected_paths)
 
         return SyncSummary(
             scanned_files=scanned_files,

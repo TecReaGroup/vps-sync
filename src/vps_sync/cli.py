@@ -39,11 +39,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         settings = SyncSettings.from_env_file(arguments.env_file)
         configure_logging(settings.log_level)
-        LOGGER.info(
-            "Synchronization started: direction=%s overwrite=%s",
-            arguments.direction,
-            settings.overwrite,
-        )
+        LOGGER.info("Synchronization started: direction=%s", arguments.direction)
         synchronizer = DirectorySynchronizer(settings)
         summary = (
             synchronizer.upload() if arguments.direction == "upload" else synchronizer.download()

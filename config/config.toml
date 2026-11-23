@@ -1,2 +1,0 @@
-# true: mirror sync; false: incremental sync keeping extras; both skip identical files.
-overwrite = true
