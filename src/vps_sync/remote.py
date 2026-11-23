@@ -20,7 +20,7 @@ from vps_sync.tree import SynchronizationError, TreeSnapshot, is_temporary_file_
 
 CONNECTION_TIMEOUT_SECONDS = 30
 REMOTE_HASH_WORKERS = 4
-REMOTE_HASH_BATCH_SIZE = 1000
+REMOTE_READ_CHUNK_SIZE = 64 * 1024
 LOGGER = logging.getLogger("vps_sync.remote")
 
 
@@ -58,6 +58,27 @@ def open_sftp_session(settings: SyncSettings) -> Iterator[SftpSession]:
         ssh_client.close()
 
 
+def stream_remote_command(
+    ssh: SSHClient,
+    command: str,
+    operation: str,
+    stdin_payload: bytes = b"",
+) -> Iterator[bytes]:
+    """Execute one remote command, yield stdout chunks as they arrive, and require exit 0"""
+    command_input, command_output, command_error = ssh.exec_command(command)
+    if stdin_payload:
+        command_input.channel.sendall(stdin_payload)
+    command_input.channel.shutdown_write()
+    channel = command_output.channel
+    while chunk := channel.recv(REMOTE_READ_CHUNK_SIZE):
+        yield chunk
+    error_text = command_error.read().decode("utf-8", errors="replace").strip()
+    exit_status = channel.recv_exit_status()
+    if exit_status != 0:
+        detail = error_text or f"exit status {exit_status}"
+        raise SynchronizationError(f"{operation} failed: {detail}")
+
+
 def run_remote_command(
     ssh: SSHClient,
     command: str,
@@ -65,17 +86,7 @@ def run_remote_command(
     stdin_payload: bytes = b"",
 ) -> bytes:
     """Execute one remote command, feed it stdin, and require a zero exit status"""
-    command_input, command_output, command_error = ssh.exec_command(command)
-    if stdin_payload:
-        command_input.channel.sendall(stdin_payload)
-    command_input.channel.shutdown_write()
-    output_bytes = bytes(command_output.read())
-    error_text = command_error.read().decode("utf-8", errors="replace").strip()
-    exit_status = command_output.channel.recv_exit_status()
-    if exit_status != 0:
-        detail = error_text or f"exit status {exit_status}"
-        raise SynchronizationError(f"{operation} failed: {detail}")
-    return output_bytes
+    return b"".join(stream_remote_command(ssh, command, operation, stdin_payload))
 
 
 def resolve_remote_root(sftp: SFTPClient, configured_path: str) -> PurePosixPath:
@@ -102,21 +113,16 @@ def _decode_path(raw_path: bytes) -> PurePosixPath:
         raise SynchronizationError(f"Remote path is not valid UTF-8: {raw_path!r}") from error
 
 
-def _parse_md5_output(output_bytes: bytes) -> dict[PurePosixPath, str]:
-    """Parse GNU ``md5sum --zero`` output, which never escapes file names"""
-    digests: dict[PurePosixPath, str] = {}
-    for record in output_bytes.split(b"\0"):
-        if not record:
-            continue
-        if len(record) < 35 or record[32:34] not in {b"  ", b" *"}:
-            raise SynchronizationError("Remote md5sum returned malformed output")
-        try:
-            digest = record[:32].decode("ascii").lower()
-            int(digest, 16)
-        except (UnicodeError, ValueError) as error:
-            raise SynchronizationError("Remote md5sum returned malformed output") from error
-        digests[_decode_path(record[34:])] = digest
-    return digests
+def _parse_md5_record(record: bytes) -> tuple[PurePosixPath, str]:
+    """Parse one GNU ``md5sum --zero`` record, which never escapes file names"""
+    if len(record) < 35 or record[32:34] not in {b"  ", b" *"}:
+        raise SynchronizationError("Remote md5sum returned malformed output")
+    try:
+        digest = record[:32].decode("ascii").lower()
+        int(digest, 16)
+    except (UnicodeError, ValueError) as error:
+        raise SynchronizationError("Remote md5sum returned malformed output") from error
+    return _decode_path(record[34:]), digest
 
 
 class RemoteTree:
@@ -160,27 +166,27 @@ class RemoteTree:
         paths: list[PurePosixPath],
         on_hashed: Callable[[int], None],
     ) -> dict[PurePosixPath, str]:
-        """Hash files on the VPS in batches; ``on_hashed`` receives each batch size"""
-        # Each md5sum worker writes to its own file because concurrent writers to one
-        # pipe could interleave records that exceed PIPE_BUF
-        worker_script = shlex.quote('exec md5sum --zero -- "$@" > "$0/$$"')
+        """Hash files on the VPS in parallel; ``on_hashed(1)`` fires as each digest arrives"""
+        # One md5sum process per file emits its record in a single write at exit, which
+        # is atomic on a shared pipe below PIPE_BUF. A longer path could interleave, but
+        # that only corrupts records and trips the malformed/omitted checks below
+        command = (
+            f"cd -- {self._quoted_root} && "
+            f"xargs -0 -r -n 1 -P {REMOTE_HASH_WORKERS} md5sum --zero --"
+        )
+        output_chunks = stream_remote_command(
+            self._ssh, command, "Remote checksum", _null_delimited(paths)
+        )
         digests: dict[PurePosixPath, str] = {}
-        for offset in range(0, len(paths), REMOTE_HASH_BATCH_SIZE):
-            batch = paths[offset : offset + REMOTE_HASH_BATCH_SIZE]
-            files_per_worker = -(-len(batch) // REMOTE_HASH_WORKERS)
-            command = (
-                f"cd -- {self._quoted_root} || exit; "
-                "checksum_dir=$(mktemp -d) || exit; "
-                "trap 'rm -rf -- \"$checksum_dir\"' EXIT; "
-                f"xargs -0 -r -n {files_per_worker} -P {REMOTE_HASH_WORKERS} "
-                f'sh -c {worker_script} "$checksum_dir" || exit; '
-                'find "$checksum_dir" -type f -exec cat -- {} +'
-            )
-            output = run_remote_command(
-                self._ssh, command, "Remote checksum", _null_delimited(batch)
-            )
-            digests.update(_parse_md5_output(output))
-            on_hashed(len(batch))
+        unfinished_record = b""
+        for chunk in output_chunks:
+            *records, unfinished_record = (unfinished_record + chunk).split(b"\0")
+            for record in records:
+                relative_path, digest = _parse_md5_record(record)
+                digests[relative_path] = digest
+                on_hashed(1)
+        if unfinished_record:
+            raise SynchronizationError("Remote md5sum returned malformed output")
         missing_paths = [path for path in paths if path not in digests]
         if missing_paths:
             raise SynchronizationError(f"Remote md5sum omitted {missing_paths[0]}")

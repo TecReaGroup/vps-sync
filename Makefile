@@ -4,7 +4,6 @@ ENV_FILE ?= .env
 .PHONY: install upload download
 
 install:
-	@test -f "$(ENV_FILE)" || cp .env.example "$(ENV_FILE)"
 	$(UV) sync --locked --managed-python
 
 download:
