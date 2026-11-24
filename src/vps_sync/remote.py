@@ -16,11 +16,24 @@ import paramiko
 from paramiko import SFTPClient, SSHClient
 
 from vps_sync.config import SyncSettings
-from vps_sync.tree import SynchronizationError, TreeSnapshot, is_temporary_file_name
+from vps_sync.digest_cache import (
+    CachedDigest,
+    DigestCache,
+    FileStamp,
+    parse_digest_cache,
+    serialize_digest_cache,
+)
+from vps_sync.tree import (
+    SynchronizationError,
+    TreeSnapshot,
+    is_temporary_file_name,
+    temporary_file_name,
+)
 
 CONNECTION_TIMEOUT_SECONDS = 30
 REMOTE_HASH_WORKERS = 4
 REMOTE_READ_CHUNK_SIZE = 64 * 1024
+DIGEST_CACHE_NAME = ".vps-sync-digests.json"
 LOGGER = logging.getLogger("vps_sync.remote")
 
 
@@ -126,42 +139,111 @@ def _parse_md5_record(record: bytes) -> tuple[PurePosixPath, str]:
 
 
 class RemoteTree:
-    """The remote synchronization root, operated through bulk shell commands"""
+    """The remote synchronization root, operated through bulk shell commands.
+
+    Remote digests are cached in ``DIGEST_CACHE_NAME`` at the root because hashing
+    a FUSE-mounted object store reads every file back from the bucket. The cache file
+    itself is invisible to mirroring
+    """
 
     def __init__(self, session: SftpSession, root: PurePosixPath) -> None:
         self.root = root
         self.label = f"remote directory {root}"
         self._ssh = session.ssh
+        self._sftp = session.sftp
         self._quoted_root = shlex.quote(str(root))
+        self._file_stamps: dict[PurePosixPath, FileStamp] = {}
+        self._previous_digests: DigestCache = {}
+        # Rebuilt each run from cache hits and fresh digests, which prunes vanished files
+        self._current_digests: DigestCache = {}
 
     def ensure_root(self) -> None:
         """Create the remote root and its parents when missing"""
         run_remote_command(self._ssh, f"mkdir -p -- {self._quoted_root}", "Remote root creation")
 
     def snapshot(self) -> TreeSnapshot:
-        """List every entry below the root with one ``find`` call"""
+        """List every entry below the root with one ``find`` call and load the digest cache"""
         command = (
             f"[ -d {self._quoted_root} ] || {{ printf 'Remote directory does not exist: %s\\n' "
             f"{self._quoted_root} >&2; exit 1; }}; "
-            f"cd -- {self._quoted_root} && find . -mindepth 1 -printf '%y\\0%s\\0%P\\0'"
+            f"cd -- {self._quoted_root} && find . -mindepth 1 -printf '%y\\0%s\\0%T@\\0%P\\0'"
         )
         fields = run_remote_command(self._ssh, command, "Remote listing").split(b"\0")
+        cache_path = PurePosixPath(DIGEST_CACHE_NAME)
         file_sizes: dict[PurePosixPath, int] = {}
         directories: set[PurePosixPath] = set()
         unsupported: set[PurePosixPath] = set()
-        # Records are (type, size, relative path) triples followed by one trailing empty field
-        for offset in range(0, len(fields) - 1, 3):
-            entry_type, raw_size, raw_path = fields[offset : offset + 3]
+        # Records are (type, size, mtime, relative path) followed by one trailing empty field
+        for offset in range(0, len(fields) - 1, 4):
+            entry_type, raw_size, raw_mtime, raw_path = fields[offset : offset + 4]
             relative_path = _decode_path(raw_path)
+            if relative_path == cache_path:
+                continue
             if entry_type == b"d":
                 directories.add(relative_path)
             elif entry_type == b"f" and not is_temporary_file_name(relative_path.name):
                 file_sizes[relative_path] = int(raw_size)
+                self._file_stamps[relative_path] = FileStamp(int(raw_size), raw_mtime.decode())
             else:
                 unsupported.add(relative_path)
+        self._previous_digests = self._load_digest_cache()
         return TreeSnapshot(file_sizes, directories, unsupported)
 
     def hash_files(
+        self,
+        paths: list[PurePosixPath],
+        on_hashed: Callable[[int], None],
+    ) -> dict[PurePosixPath, str]:
+        """Reuse cached digests whose size and mtime still match, hash the rest, and persist"""
+        stale_paths: list[PurePosixPath] = []
+        for path in paths:
+            cached = self._previous_digests.get(path)
+            if cached is not None and cached.stamp == self._file_stamps[path]:
+                self._current_digests[path] = cached
+                on_hashed(1)
+            else:
+                stale_paths.append(path)
+        LOGGER.info(
+            "Remote digests: reused=%d computed=%d", len(paths) - len(stale_paths), len(stale_paths)
+        )
+        for path, md5 in self._compute_digests(stale_paths, on_hashed).items():
+            self._current_digests[path] = CachedDigest(self._file_stamps[path], md5)
+        self.save_digest_cache()
+        return {path: self._current_digests[path].md5 for path in paths}
+
+    def commit_upload(
+        self, temporary_file: PurePosixPath, relative_path: PurePosixPath, expected_md5: str
+    ) -> None:
+        """Verify an uploaded temporary file, rename it into place, and cache its digest"""
+        target_file = self.root / relative_path
+        verify_and_replace = (
+            f"tmp={shlex.quote(str(temporary_file))}; target={shlex.quote(str(target_file))}; "
+            'actual=$(md5sum < "$tmp") || exit; '
+            f'if [ "${{actual%% *}}" = {expected_md5} ]; then mv -f -- "$tmp" "$target" && '
+            "find \"$target\" -maxdepth 0 -printf '%s\\0%T@'; "
+            'else rm -f -- "$tmp"; echo "MD5 mismatch after upload" >&2; exit 1; fi'
+        )
+        # Paramiko transports multiplex channels, so upload workers may share this session
+        output = run_remote_command(self._ssh, verify_and_replace, f"Upload of {relative_path}")
+        raw_size, raw_mtime = output.split(b"\0")
+        stamp = FileStamp(int(raw_size), raw_mtime.decode())
+        self._current_digests[relative_path] = CachedDigest(stamp, expected_md5)
+
+    def save_digest_cache(self) -> None:
+        """Atomically replace the cache with every digest known in this run"""
+        temporary_path = self.root / temporary_file_name(DIGEST_CACHE_NAME)
+        with self._sftp.open(str(temporary_path), "wb") as cache_stream:
+            cache_stream.write(serialize_digest_cache(self._current_digests))
+        self._sftp.posix_rename(str(temporary_path), str(self.root / DIGEST_CACHE_NAME))
+
+    def _load_digest_cache(self) -> DigestCache:
+        try:
+            with self._sftp.open(str(self.root / DIGEST_CACHE_NAME), "rb") as cache_stream:
+                return parse_digest_cache(cache_stream.read())
+        except FileNotFoundError:
+            return {}
+
+    def _compute_digests(
         self,
         paths: list[PurePosixPath],
         on_hashed: Callable[[int], None],

@@ -8,7 +8,6 @@ import errno
 import hashlib
 import logging
 import queue
-import shlex
 import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -32,7 +31,6 @@ from vps_sync.remote import (
     SftpSession,
     open_sftp_session,
     resolve_remote_root,
-    run_remote_command,
 )
 from vps_sync.tree import (
     HASH_CHUNK_SIZE,
@@ -108,8 +106,10 @@ class DirectorySynchronizer:
             remote_root = resolve_remote_root(session.sftp, self._settings.remote_directory)
             remote_tree = RemoteTree(session, remote_root)
             remote_tree.ensure_root()
-            upload = partial(_upload_file, local_tree=local_tree, remote_root=remote_root)
-            return self._mirror(local_tree, remote_tree, upload, "Uploading")
+            upload = partial(_upload_file, local_tree=local_tree, remote_tree=remote_tree)
+            summary = self._mirror(local_tree, remote_tree, upload, "Uploading")
+            remote_tree.save_digest_cache()
+            return summary
 
     def download(self) -> SyncSummary:
         """Make the local directory an exact mirror of the remote directory"""
@@ -283,17 +283,11 @@ def _upload_file(
     on_bytes: Callable[[int], None],
     *,
     local_tree: LocalTree,
-    remote_root: PurePosixPath,
+    remote_tree: RemoteTree,
 ) -> None:
-    """Upload to a temporary file, then verify and rename it in one remote command"""
-    remote_file = remote_root / relative_path
+    """Upload to a temporary file, then let the remote tree verify and rename it"""
+    remote_file = remote_tree.root / relative_path
     temporary_file = remote_file.with_name(temporary_file_name(remote_file.name))
-    verify_and_replace = (
-        f"tmp={shlex.quote(str(temporary_file))}; target={shlex.quote(str(remote_file))}; "
-        'actual=$(md5sum < "$tmp") || exit; '
-        f'if [ "${{actual%% *}}" = {expected_md5} ]; then mv -f -- "$tmp" "$target"; '
-        'else rm -f -- "$tmp"; echo "MD5 mismatch after upload" >&2; exit 1; fi'
-    )
     try:
         session.sftp.put(
             str(local_tree.path_of(relative_path)),
@@ -301,7 +295,7 @@ def _upload_file(
             callback=_CumulativeByteCounter(on_bytes),
             confirm=False,
         )
-        run_remote_command(session.ssh, verify_and_replace, f"Upload of {relative_path}")
+        remote_tree.commit_upload(temporary_file, relative_path, expected_md5)
     except Exception:
         _remove_remote_file_if_present(session, temporary_file)
         raise
